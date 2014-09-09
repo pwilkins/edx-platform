@@ -269,6 +269,20 @@ class VideoPage(PageObject):
         return not self.q(css=caption_state_selector).present
 
     @wait_for_js
+    def videos_controls_visible(self):
+        """
+        Get current visibility sate of all video controls.
+
+        Returns:
+            bool: True means video controls are visible for all videos, False means video controls are not visible
+            for one or more videos
+
+        """
+        self.wait_for_ajax()
+
+        return len(self.q(css='section.video-controls.is-hidden').results) == 0
+
+    @wait_for_js
     def _captions_visibility(self, captions_new_state):
         """
         Set the video captions visibility state.
