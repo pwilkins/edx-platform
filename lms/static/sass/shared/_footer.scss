@@ -213,7 +213,7 @@ $edx-footer-bg-color: rgb(252,252,252);
   min-height: ($baseline*17.5);
   margin-right: flex-gutter();
   border-right: 1px solid rgb(230, 230, 230);
-  padding-right: ($baseline/2);
+  padding-right: ($baseline*1.5);
 
   // CASE: last child
   &:last-child {
