@@ -273,6 +273,10 @@ $edx-footer-bg-color: rgb(252,252,252);
   // CASE: has visual emphasis
   &.has-emphasis {
     @extend %t-weight4;
+
+    .copy {
+      @extend %t-weight4;
+    }
   }
 
 
