@@ -24,6 +24,8 @@ class MemberListWidget
       add_placeholder: "Enter name"
       add_btn_label: "Add Member"
       add_handler: (input) ->
+      import_btn_label: "Import Membership"
+      import_handler: (input) ->
 
     template_html = $("#member-list-widget-template").html()
     @$container.html Mustache.render template_html, params
@@ -73,6 +75,8 @@ class AuthListWidget extends MemberListWidget
       add_placeholder: gettext("Enter username or email")
       add_btn_label: $container.data 'add-button-label'
       add_handler: (input) => @add_handler input
+      import_btn_label: $container.data 'import-button-label'
+      import_handler: (input) => @import_handler input
 
     @debug = true
     @list_endpoint = $container.data 'list-endpoint'
@@ -99,6 +103,18 @@ class AuthListWidget extends MemberListWidget
         @reload_list()
     else
       @show_errors gettext "Please enter a username or email."
+
+  # handle clicks on the import button
+  import_handler: (input) ->
+    if input? and input isnt ''
+      @process_membership_import input, 'allow', (error) =>
+        # abort on error
+        return @show_errors error unless error is null
+        @clear_errors()
+        @clear_input()
+        @reload_list()
+    else
+      @show_errors gettext "Please fix the import code."
 
   # reload the list of members
   reload_list: ->
@@ -141,7 +157,7 @@ class AuthListWidget extends MemberListWidget
       url: @list_endpoint
       data: rolename: @rolename
       success: (data) => cb? null, data[@rolename]
-      error: std_ajax_err => 
+      error: std_ajax_err =>
         `// Translators: A rolename appears this sentence. A rolename is something like "staff" or "beta tester".`
         cb? gettext("Error fetching list for role") + " '#{@rolename}'"
 
@@ -159,6 +175,11 @@ class AuthListWidget extends MemberListWidget
         action: action
       success: (data) => @member_response data
       error: std_ajax_err => cb? gettext "Error changing user's permissions."
+
+  # first test: do we even get called when 'import' button is clicked?
+  # initial implementation based on modify_member_access()
+  process_membership_import: (unique_student_identifier, action, cb) ->
+    console.log("Quack! Process membership import.")
 
   member_response: (data) ->
     @clear_errors()
@@ -189,7 +210,7 @@ class BetaTesterBulkAddition
     @$btn_beta_testers.click (event) =>
       emailStudents = @$checkbox_emailstudents.is(':checked')
       autoEnroll = @$checkbox_autoenroll.is(':checked')
-      send_data = 
+      send_data =
         action: $(event.target).data('action')  # 'add' or 'remove'
         identifiers: @$identifier_input.val()
         email_students: emailStudents
@@ -580,7 +601,7 @@ class Membership
 
     # isolate # initialize BatchEnrollment subsection
     plantTimeout 0, => new BatchEnrollment @$section.find '.batch-enrollment'
-    
+
     # initialize BetaTesterBulkAddition subsection
     plantTimeout 0, => new BetaTesterBulkAddition @$section.find '.batch-beta-testers'
 
