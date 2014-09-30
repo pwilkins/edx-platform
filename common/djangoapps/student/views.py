@@ -54,7 +54,6 @@ from verify_student.models import SoftwareSecurePhotoVerification, MidcourseReve
 from certificates.models import CertificateStatuses, certificate_status_for_student
 from dark_lang.models import DarkLangConfig
 
-from xmodule.modulestore.exceptions import ItemNotFoundError
 from xmodule.modulestore.django import modulestore
 from opaque_keys import InvalidKeyError
 from opaque_keys.edx.locations import SlashSeparatedCourseKey
@@ -401,7 +400,7 @@ def register_user(request, extra_context=None):
 
     # If third-party auth is enabled, prepopulate the form with data from the
     # selected provider.
-    if settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH') and pipeline.running(request):
+    if microsite.get_value('ENABLE_THIRD_PARTY_AUTH', settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH')) and pipeline.running(request):
         running_pipeline = pipeline.get(request)
         current_provider = provider.Registry.get_by_backend_name(running_pipeline.get('backend'))
         overrides = current_provider.get_register_form_data(running_pipeline.get('kwargs'))
@@ -580,7 +579,7 @@ def dashboard(request):
         'provider_states': [],
     }
 
-    if settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH'):
+    if microsite.get_value('ENABLE_THIRD_PARTY_AUTH', settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH')):
         context['duplicate_provider'] = pipeline.get_duplicate_provider(messages.get_messages(request))
         context['provider_user_states'] = pipeline.get_provider_user_states(user)
 
@@ -616,7 +615,7 @@ def try_change_enrollment(request):
 
 
 @require_POST
-def change_enrollment(request, auto_register=False):
+def change_enrollment(request, auto_register=False, check_access=True):
     """
     Modify the enrollment status for the logged-in user.
 
@@ -651,20 +650,7 @@ def change_enrollment(request, auto_register=False):
         Response
 
     """
-    user = request.user
-
-    action = request.POST.get("enrollment_action")
-    if 'course_id' not in request.POST:
-        return HttpResponseBadRequest(_("Course id not specified"))
-
-    try:
-        course_id = SlashSeparatedCourseKey.from_deprecated_string(request.POST.get("course_id"))
-    except InvalidKeyError:
-        log.warning("User {username} tried to {action} with invalid course id: {course_id}".format(
-            username=user.username, action=action, course_id=request.POST.get("course_id")
-        ))
-        return HttpResponseBadRequest(_("Invalid course id"))
-
+    # Sets the auto_register flag, if that's desired
     # TODO (ECOM-16): Remove this once the auto-registration A/B test completes
     # If a user is in the experimental condition (auto-registration enabled),
     # immediately set a session flag so they stay in the experimental condition.
@@ -676,6 +662,31 @@ def change_enrollment(request, auto_register=False):
     if request.session.get('auto_register') and not auto_register:
         auto_register = True
 
+    # Get the user
+    user = request.user
+
+    # Ensure the user is authenticated
+    if not user.is_authenticated():
+        return HttpResponseForbidden()
+
+    # Ensure we received a course_id
+    action = request.POST.get("enrollment_action")
+    if 'course_id' not in request.POST:
+        return HttpResponseBadRequest(_("Course id not specified"))
+
+    try:
+        course_id = SlashSeparatedCourseKey.from_deprecated_string(request.POST.get("course_id"))
+    except InvalidKeyError:
+        log.warning(
+            "User {username} tried to {action} with invalid course id: {course_id}".format(
+                username=user.username,
+                action=action,
+                course_id=request.POST.get("course_id")
+            )
+        )
+        return HttpResponseBadRequest(_("Invalid course id"))
+
+    # Don't execute auto-register for the set of courses excluded from auto-registration
     # TODO (ECOM-16): Remove this once the auto-registration A/B test completes
     # We've agreed to exclude certain courses from the A/B test.  If we find ourselves
     # registering for one of these courses, immediately switch to the control.
@@ -684,33 +695,13 @@ def change_enrollment(request, auto_register=False):
         if 'auto_register' in request.session:
             del request.session['auto_register']
 
-    if not user.is_authenticated():
-        return HttpResponseForbidden()
-
     if action == "enroll":
         # Make sure the course exists
         # We don't do this check on unenroll, or a bad course id can't be unenrolled from
-        try:
-            course = modulestore().get_course(course_id)
-        except ItemNotFoundError:
+        if not modulestore().has_course(course_id):
             log.warning("User {0} tried to enroll in non-existent course {1}"
                         .format(user.username, course_id))
             return HttpResponseBadRequest(_("Course id is invalid"))
-
-        if not has_access(user, 'enroll', course):
-            return HttpResponseBadRequest(_("Enrollment is closed"))
-
-        # see if we have already filled up all allowed enrollments
-        is_course_full = CourseEnrollment.is_course_full(course)
-
-        if is_course_full:
-            return HttpResponseBadRequest(_("Course is full"))
-
-        # check to see if user is currently enrolled in that course
-        if CourseEnrollment.is_enrolled(user, course_id):
-            return HttpResponseBadRequest(
-                _("Student is already enrolled")
-            )
 
         # We use this flag to determine which condition of an AB-test
         # for auto-registration we're currently in.
@@ -737,7 +728,10 @@ def change_enrollment(request, auto_register=False):
                 # by its slug.  If they do, it's possible (based on the state of the database)
                 # for no such model to exist, even though we've set the enrollment type
                 # to "honor".
-                CourseEnrollment.enroll(user, course.id)
+                try:
+                    CourseEnrollment.enroll(user, course_id, check_access=check_access)
+                except Exception:
+                    return HttpResponseBadRequest(_("Could not enroll"))
 
             # If we have more than one course mode or professional ed is enabled,
             # then send the user to the choose your track page.
@@ -770,7 +764,10 @@ def change_enrollment(request, auto_register=False):
                     reverse("course_modes_choose", kwargs={'course_id': unicode(course_id)})
                 )
 
-            CourseEnrollment.enroll(user, course.id, mode=current_mode.slug)
+            try:
+                CourseEnrollment.enroll(user, course_id, mode=current_mode.slug, check_access=check_access)
+            except Exception:
+                return HttpResponseBadRequest(_("Could not enroll"))
 
             return HttpResponse()
 
@@ -863,7 +860,7 @@ def login_user(request, error=""):  # pylint: disable-msg=too-many-statements,un
     redirect_url = None
     response = None
     running_pipeline = None
-    third_party_auth_requested = settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH') and pipeline.running(request)
+    third_party_auth_requested = microsite.get_value('ENABLE_THIRD_PARTY_AUTH', settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH')) and pipeline.running(request)
     third_party_auth_successful = False
     trumped_by_first_party_auth = bool(request.POST.get('email')) or bool(request.POST.get('password'))
     user = None
@@ -1005,7 +1002,8 @@ def login_user(request, error=""):  # pylint: disable-msg=too-many-statements,un
             "edx.bi.user.account.authenticated",
             {
                 'category': "conversion",
-                'label': registration_course_id
+                'label': registration_course_id,
+                'provider': None
             },
             context={
                 'Google Analytics': {
@@ -1295,7 +1293,7 @@ def create_account(request, post_override=None):  # pylint: disable-msg=too-many
         getattr(settings, 'REGISTRATION_EXTRA_FIELDS', {})
     )
 
-    if settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH') and pipeline.running(request):
+    if microsite.get_value('ENABLE_THIRD_PARTY_AUTH', settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH')) and pipeline.running(request):
         post_vars = dict(post_vars.items())
         post_vars.update({'password': pipeline.make_random_password()})
 
@@ -1469,17 +1467,25 @@ def create_account(request, post_override=None):  # pylint: disable-msg=too-many
     if settings.FEATURES.get('SEGMENT_IO_LMS') and hasattr(settings, 'SEGMENT_IO_LMS_KEY'):
         tracking_context = tracker.get_tracker().resolve_context()
         analytics.identify(user.id, {
-            email: email,
-            username: username,
+            'email': email,
+            'username': username,
         })
+
+        # If the user is registering via 3rd party auth, track which provider they use
+        provider_name = None
+        if settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH') and pipeline.running(request):
+            running_pipeline = pipeline.get(request)
+            current_provider = provider.Registry.get_by_backend_name(running_pipeline.get('backend'))
+            provider_name = current_provider.NAME
 
         registration_course_id = request.session.get('registration_course_id')
         analytics.track(
             user.id,
             "edx.bi.user.account.registered",
             {
-                "category": "conversion",
-                "label": registration_course_id
+                'category': 'conversion',
+                'label': registration_course_id,
+                'provider': provider_name
             },
             context={
                 'Google Analytics': {
@@ -1503,7 +1509,12 @@ def create_account(request, post_override=None):  # pylint: disable-msg=too-many
     message = render_to_string('emails/activation_email.txt', context)
 
     # don't send email if we are doing load testing or random user generation for some reason
-    if not (settings.FEATURES.get('AUTOMATIC_AUTH_FOR_TESTING')):
+    # or external auth with bypass activated
+    send_email = (
+        not settings.FEATURES.get('AUTOMATIC_AUTH_FOR_TESTING') and
+        not (do_external_auth and settings.FEATURES.get('BYPASS_ACTIVATION_EMAIL_FOR_EXTAUTH'))
+    )
+    if send_email:
         from_address = microsite.get_value(
             'email_from_address',
             settings.DEFAULT_FROM_EMAIL
@@ -1553,7 +1564,7 @@ def create_account(request, post_override=None):  # pylint: disable-msg=too-many
     redirect_url = try_change_enrollment(request)
 
     # Resume the third-party-auth pipeline if necessary.
-    if settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH') and pipeline.running(request):
+    if microsite.get_value('ENABLE_THIRD_PARTY_AUTH', settings.FEATURES.get('ENABLE_THIRD_PARTY_AUTH')) and pipeline.running(request):
         running_pipeline = pipeline.get(request)
         redirect_url = pipeline.get_complete_url(running_pipeline['backend'])
 

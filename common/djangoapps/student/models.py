@@ -26,7 +26,7 @@ from django.utils import timezone
 from django.contrib.auth.models import User
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.signals import user_logged_in, user_logged_out
-from django.db import models, IntegrityError
+from django.db import models, IntegrityError, transaction
 from django.db.models import Count
 from django.dispatch import receiver, Signal
 from django.core.exceptions import ObjectDoesNotExist
@@ -37,10 +37,14 @@ from eventtracking import tracker
 from importlib import import_module
 
 from opaque_keys.edx.locations import SlashSeparatedCourseKey
+from xmodule.modulestore import Location
+from opaque_keys import InvalidKeyError
 
 import lms.lib.comment_client as cc
 from util.query import use_read_replica_if_available
 from xmodule_django.models import CourseKeyField, NoneToEmptyManager
+from xmodule.modulestore.exceptions import ItemNotFoundError
+from xmodule.modulestore.django import modulestore
 from opaque_keys.edx.keys import CourseKey
 from functools import total_ordering
 
@@ -98,7 +102,7 @@ def anonymous_id_for_user(user, course_id, save=True):
     hasher.update(settings.SECRET_KEY)
     hasher.update(unicode(user.id))
     if course_id:
-        hasher.update(course_id.to_deprecated_string())
+        hasher.update(course_id.to_deprecated_string().encode('utf-8'))
     digest = hasher.hexdigest()
 
     if not hasattr(user, '_anonymous_id'):
@@ -276,6 +280,59 @@ class UserProfile(models.Model):
         self.set_meta(meta)
         self.save()
 
+    @transaction.commit_on_success
+    def update_name(self, new_name):
+        """Update the user's name, storing the old name in the history.
+
+        Implicitly saves the model.
+        If the new name is not the same as the old name, do nothing.
+
+        Arguments:
+            new_name (unicode): The new full name for the user.
+
+        Returns:
+            None
+
+        """
+        if self.name == new_name:
+            return
+
+        if self.name:
+            meta = self.get_meta()
+            if 'old_names' not in meta:
+                meta['old_names'] = []
+            meta['old_names'].append([self.name, u"", datetime.now(UTC).isoformat()])
+            self.set_meta(meta)
+
+        self.name = new_name
+        self.save()
+
+    @transaction.commit_on_success
+    def update_email(self, new_email):
+        """Update the user's email and save the change in the history.
+
+        Implicitly saves the model.
+        If the new email is the same as the old email, do not update the history.
+
+        Arguments:
+            new_email (unicode): The new email for the user.
+
+        Returns:
+            None
+        """
+        if self.user.email == new_email:
+            return
+
+        meta = self.get_meta()
+        if 'old_emails' not in meta:
+            meta['old_emails'] = []
+        meta['old_emails'].append([self.user.email, datetime.now(UTC).isoformat()])
+        self.set_meta(meta)
+        self.save()
+
+        self.user.email = new_email
+        self.user.save()
+
 
 class UserSignupSource(models.Model):
     """
@@ -339,6 +396,23 @@ class PendingEmailChange(models.Model):
     user = models.OneToOneField(User, unique=True, db_index=True)
     new_email = models.CharField(blank=True, max_length=255, db_index=True)
     activation_key = models.CharField(('activation key'), max_length=32, unique=True, db_index=True)
+
+    def request_change(self, email):
+        """Request a change to a user's email.
+
+        Implicitly saves the pending email change record.
+
+        Arguments:
+            email (unicode): The proposed new email for the user.
+
+        Returns:
+            unicode: The activation code to confirm the change.
+
+        """
+        self.new_email = email
+        self.activation_key = uuid.uuid4().hex
+        self.save()
+        return self.activation_key
 
 
 EVENT_NAME_ENROLLMENT_ACTIVATED = 'edx.course.enrollment.activated'
@@ -587,6 +661,22 @@ class LoginFailures(models.Model):
             return
 
 
+class CourseEnrollmentException(Exception):
+    pass
+
+class NonExistentCourseError(CourseEnrollmentException):
+    pass
+
+class EnrollmentClosedError(CourseEnrollmentException):
+    pass
+
+class CourseFullError(CourseEnrollmentException):
+    pass
+
+class AlreadyEnrolledError(CourseEnrollmentException):
+    pass
+
+
 class CourseEnrollment(models.Model):
     """
     Represents a Student's Enrollment record for a single Course. You should
@@ -775,7 +865,7 @@ class CourseEnrollment(models.Model):
                 log.exception('Unable to emit event %s for user %s and course %s', event_name, self.user.username, self.course_id)
 
     @classmethod
-    def enroll(cls, user, course_key, mode="honor"):
+    def enroll(cls, user, course_key, mode="honor", check_access=False):
         """
         Enroll a user in a course. This saves immediately.
 
@@ -785,18 +875,74 @@ class CourseEnrollment(models.Model):
                attribute), this method will automatically save it before
                adding an enrollment for it.
 
-        `course_id` is our usual course_id string (e.g. "edX/Test101/2013_Fall)
+        `course_key` is our usual course_id string (e.g. "edX/Test101/2013_Fall)
 
         `mode` is a string specifying what kind of enrollment this is. The
                default is "honor", meaning honor certificate. Future options
                may include "audit", "verified_id", etc. Please don't use it
                until we have these mapped out.
 
+        `check_access`: if True, we check that an accessible course actually
+                exists for the given course_key before we enroll the student.
+                The default is set to False to avoid breaking legacy code or
+                code with non-standard flows (ex. beta tester invitations), but
+                for any standard enrollment flow you probably want this to be True.
+
+        Exceptions that can be raised: NonExistentCourseError,
+        EnrollmentClosedError, CourseFullError, AlreadyEnrolledError.  All these
+        are subclasses of CourseEnrollmentException if you want to catch all of
+        them in the same way.
+
         It is expected that this method is called from a method which has already
-        verified the user authentication and access.
+        verified the user authentication.
 
         Also emits relevant events for analytics purposes.
         """
+        from courseware.access import has_access
+
+        # All the server-side checks for whether a user is allowed to enroll.
+        try:
+            course = modulestore().get_course(course_key)
+        except ItemNotFoundError:
+            log.warning(
+                "User {0} failed to enroll in non-existent course {1}".format(
+                    user.username,
+                    course_key.to_deprecated_string()
+                )
+            )
+            raise NonExistentCourseError
+
+        if check_access:
+            if course is None:
+                raise NonExistentCourseError
+            if not has_access(user, 'enroll', course):
+                log.warning(
+                    "User {0} failed to enroll in course {1} because enrollment is closed".format(
+                        user.username,
+                        course_key.to_deprecated_string()
+                    )
+                )
+                raise EnrollmentClosedError
+
+            if CourseEnrollment.is_course_full(course):
+                log.warning(
+                    "User {0} failed to enroll in full course {1}".format(
+                        user.username,
+                        course_key.to_deprecated_string()
+                    )
+                )
+                raise CourseFullError
+        if CourseEnrollment.is_enrolled(user, course_key):
+            log.warning(
+                "User {0} attempted to enroll in {1}, but they were already enrolled".format(
+                    user.username,
+                    course_key.to_deprecated_string()
+                )
+            )
+            if check_access:
+                raise AlreadyEnrolledError
+
+        # User is allowed to enroll if they've reached this point.
         enrollment = cls.get_or_create_enrollment(user, course_key)
         enrollment.update_enrollment(is_active=True, mode=mode)
         return enrollment
@@ -1018,6 +1164,14 @@ class CourseEnrollment(models.Model):
         else:
             return True
 
+    @property
+    def username(self):
+        return self.user.username
+
+    @property
+    def course(self):
+        return modulestore().get_course(self.course_id)
+
 
 class CourseEnrollmentAllowed(models.Model):
     """
@@ -1064,7 +1218,7 @@ class CourseAccessRole(models.Model):
         convenience function to make eq overrides easier and clearer. arbitrary decision
         that role is primary, followed by org, course, and then user
         """
-        return (self.role, self.org, self.course_id, self.user)
+        return (self.role, self.org, self.course_id, self.user_id)
 
     def __eq__(self, other):
         """

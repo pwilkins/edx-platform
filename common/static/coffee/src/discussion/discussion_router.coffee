@@ -27,9 +27,9 @@ if Backbone?
           mode: "tab"
         )
         @newPostView.render()
+        @listenTo( @newPostView, 'newPost:cancel', @hideNewPost )
         $('.new-post-btn').bind "click", @showNewPost
         $('.new-post-btn').bind "keydown", (event) => DiscussionUtil.activateOnSpace(event, @showNewPost)
-        @newPostView.$('.cancel').bind "click", @hideNewPost
 
     allThreads: ->
       @nav.updateSidebar()
@@ -54,7 +54,12 @@ if Backbone?
       if(@newPost.is(":visible"))
         @newPost.fadeOut()
 
-      @main = new DiscussionThreadView(el: $(".forum-content"), model: @thread, mode: "tab")
+      @main = new DiscussionThreadView(
+        el: $(".forum-content"),
+        model: @thread,
+        mode: "tab",
+        course_settings: @course_settings,
+      )
       @main.render()
       @main.on "thread:responses:rendered", =>
         @nav.updateSidebar()
@@ -74,10 +79,9 @@ if Backbone?
           $('.new-post-title').focus()
       )
 
-    hideNewPost: (event) =>
+    hideNewPost: =>
       @newPost.fadeOut(
         duration: 200
         complete: =>
           $('.forum-content').fadeIn(200)
       )
-

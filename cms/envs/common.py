@@ -106,7 +106,7 @@ FEATURES = {
     'ADVANCED_SECURITY': False,
 
     # Modulestore to use for new courses
-    'DEFAULT_STORE_FOR_NEW_COURSE': 'mongo',
+    'DEFAULT_STORE_FOR_NEW_COURSE': None,
 }
 ENABLE_JASMINE = False
 
@@ -633,7 +633,6 @@ MAX_FAILED_LOGIN_ATTEMPTS_LOCKOUT_PERIOD_SECS = 15 * 60
 ### Apps only installed in some instances
 
 OPTIONAL_APPS = (
-    'edx_jsdraw',
     'mentoring',
 
     # edx-ora2
@@ -642,7 +641,10 @@ OPTIONAL_APPS = (
     'openassessment.assessment',
     'openassessment.fileupload',
     'openassessment.workflow',
-    'openassessment.xblock'
+    'openassessment.xblock',
+
+    # edxval
+    'edxval'
 )
 
 
