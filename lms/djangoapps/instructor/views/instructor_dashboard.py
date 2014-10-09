@@ -254,6 +254,8 @@ def _section_membership(course_key, access):
         'list_forum_members_url': reverse('list_forum_members', kwargs={'course_id': course_key.to_deprecated_string()}),
         'update_forum_role_membership_url': reverse('update_forum_role_membership', kwargs={'course_id': course_key.to_deprecated_string()}),
     }
+    print "Hello again, Charlie"
+    print "This is a success!"
     return section_data
 
 
